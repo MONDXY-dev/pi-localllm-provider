@@ -611,7 +611,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("localllm", {
     description: "Manage LocalLLM providers - wizard-based setup for any OpenAI-compatible local server",
-    async handler(_args, ctx) {
+    async handler(_args: unknown, ctx: ExtensionCommandContext) {
       await showMainMenu(pi, ctx);
     },
   });
