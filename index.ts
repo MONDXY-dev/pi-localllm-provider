@@ -136,6 +136,36 @@ export function modelsHeading(models: LLMModel[]): string {
     : "Models:";
 }
 
+// Merge a freshly detected model list with the previously stored one.
+//
+// Portals that publish bare OpenAI model cards (no context window, no
+// capability flags) detect at the 32k/no-reasoning/no-vision defaults, which
+// silently destroys any truth the user supplied by hand via `Edit model
+// capabilities` — or that a smarter detector saw on an earlier run. So a
+// refresh is treated as *new evidence*, never as a retraction: numeric fields
+// take the max of old and new, boolean/capability fields OR together, and
+// request-compat/thinking-map/sampling overrides survive unless detection
+// produced its own value from real evidence.
+export function mergeModels(existing: LLMModel[], detected: LLMModel[]): LLMModel[] {
+  const before = new Map(existing.map((m) => [m.id, m]));
+  return detected.map((d) => {
+    const o = before.get(d.id);
+    if (!o) return d;
+    const merged: LLMModel = {
+      ...d,
+      contextWindow: Math.max(d.contextWindow, o.contextWindow),
+      maxTokens: Math.max(d.maxTokens, o.maxTokens),
+      reasoning: d.reasoning || o.reasoning,
+      input: Array.from(new Set([...d.input, ...o.input])),
+    };
+    if (d.name === d.id && o.name !== o.id) merged.name = o.name;
+    if (!d.compat && o.compat) merged.compat = o.compat;
+    if (!d.thinkingLevelMap && o.thinkingLevelMap) merged.thinkingLevelMap = o.thinkingLevelMap;
+    if (!d.samplingParams && o.samplingParams) merged.samplingParams = o.samplingParams;
+    return merged;
+  });
+}
+
 export function formatModelLine(m: LLMModel): string {
   const caps = [m.reasoning ? "reasoning" : null, m.input.includes("image") ? "vision" : null].filter(
     (c): c is string => c !== null,
@@ -358,17 +388,49 @@ async function editModelCapabilities(
     const temp = current.samplingParams?.temperature;
     const OPT_VISION = `Vision: ${vision ? "on" : "off"}  (tap to turn ${vision ? "off" : "on"})`;
     const OPT_REASONING = `Reasoning: ${current.reasoning ? "on" : "off"}  (tap to turn ${current.reasoning ? "off" : "on"})`;
+    const OPT_CONTEXT = `Context window: ${current.contextWindow.toLocaleString()} tokens  (tap to change)`;
+    const OPT_MAX_TOKENS = `Max tokens: ${current.maxTokens.toLocaleString()} tokens  (tap to change)`;
     const OPT_TEMP = `Temperature: ${temp ?? "server default"}  (tap to change)`;
     const OPT_DONE = "✓ Done";
 
     const picked = await ctx.ui.select(
-      `${current.name} - manual capability override\nOverwritten by the next ↺ Refresh.`,
-      [OPT_VISION, OPT_REASONING, OPT_TEMP, OPT_DONE],
+      `${current.name} - manual capability override\nMerged with detection on ↺ Refresh.`,
+      [OPT_VISION, OPT_REASONING, OPT_CONTEXT, OPT_MAX_TOKENS, OPT_TEMP, OPT_DONE],
     );
     if (!picked || picked === OPT_DONE) break;
 
     // Asked for before the settings are re-read, so a cancelled prompt
     // leaves the stored value untouched rather than clearing it.
+    let nextContext: number | undefined;
+    if (picked === OPT_CONTEXT) {
+      const raw = await ctx.ui.input(
+        "Context window in tokens (e.g. 128000, 200000, 1000000)",
+        String(current.contextWindow),
+      );
+      if (raw === undefined) continue;
+      const parsed = parseInt(raw.trim().replace(/,/g, ""), 10);
+      if (!Number.isFinite(parsed) || parsed < 1024) {
+        ctx.ui.notify("Context window must be a number of at least 1024 tokens.", "error");
+        continue;
+      }
+      nextContext = parsed;
+    }
+
+    let nextMaxTokens: number | undefined;
+    if (picked === OPT_MAX_TOKENS) {
+      const raw = await ctx.ui.input(
+        "Max output tokens (e.g. 8192, 16384, 32768, 65536)",
+        String(current.maxTokens),
+      );
+      if (raw === undefined) continue;
+      const parsed = parseInt(raw.trim().replace(/,/g, ""), 10);
+      if (!Number.isFinite(parsed) || parsed < 256) {
+        ctx.ui.notify("Max tokens must be a number of at least 256 tokens.", "error");
+        continue;
+      }
+      nextMaxTokens = parsed;
+    }
+
     let nextTemp: { temperature?: number } | undefined;
     if (picked === OPT_TEMP) {
       const raw = await ctx.ui.input(
@@ -397,11 +459,35 @@ async function editModelCapabilities(
       if (picked === OPT_VISION) {
         return { ...m, input: vision ? (["text"] as const) : (["text", "image"] as const) };
       }
+      if (picked === OPT_CONTEXT && nextContext !== undefined) {
+        return { ...m, contextWindow: nextContext };
+      }
+      if (picked === OPT_MAX_TOKENS && nextMaxTokens !== undefined) {
+        return { ...m, maxTokens: nextMaxTokens };
+      }
       if (picked === OPT_TEMP) {
         const { samplingParams: _dropped, ...rest } = m;
         return nextTemp ? { ...rest, samplingParams: nextTemp } : rest;
       }
-      return { ...m, reasoning: !m.reasoning };
+      const nextReasoning = !m.reasoning;
+      return {
+        ...m,
+        reasoning: nextReasoning,
+        compat: nextReasoning
+          ? { supportsReasoningEffort: true, ...m.compat }
+          : m.compat,
+        thinkingLevelMap: nextReasoning && !m.thinkingLevelMap
+          ? {
+              off: "none",
+              minimal: "low",
+              low: "low",
+              medium: "medium",
+              high: "high",
+              xhigh: "xhigh",
+              max: "max",
+            }
+          : m.thinkingLevelMap,
+      };
     });
     writeSettings(s);
   }
@@ -417,7 +503,7 @@ async function editModelCapabilities(
 // ─── Server sub-menu ──────────────────────────────────────────────
 
 const OPT_REFRESH = "↺ Refresh model list from server";
-const OPT_CAPS    = "✎ Edit model capabilities (vision / reasoning / temperature)";
+const OPT_CAPS    = "✎ Edit model capabilities (vision / reasoning / context / temperature)";
 const OPT_EDIT    = "✎ Reconfigure (name / URL / key)";
 const OPT_REMOVE  = "✕ Remove this server";
 const OPT_BACK    = "← Back";
@@ -465,7 +551,8 @@ async function showServerMenu(
         continue;
       }
 
-      const updated: LLMServer = { ...server, apiType: result.apiType, models: result.models };
+      const mergedModels = mergeModels(server.models, result.models);
+      const updated: LLMServer = { ...server, apiType: result.apiType, models: mergedModels };
       const modelsChanged = modelIdsChanged(server.models, updated.models);
       const s = readSettings();
       s.servers = s.servers.map((sv) => (sv.id === serverId ? updated : sv));

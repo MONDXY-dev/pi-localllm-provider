@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatModelLine, modelIdsChanged, modelsHeading, normalizeBaseUrl } from "./index.ts";
+import { formatModelLine, mergeModels, modelIdsChanged, modelsHeading, normalizeBaseUrl } from "./index.ts";
 
 describe("normalizeBaseUrl", () => {
   it("appends /v1 when missing", () => {
@@ -185,5 +185,64 @@ describe("modelsHeading", () => {
   it("omits the legend when no model reports loaded state", () => {
     expect(modelsHeading([baseModel])).toBe("Models:");
     expect(modelsHeading([])).toBe("Models:");
+  });
+});
+
+describe("mergeModels", () => {
+  const stored = {
+    id: "deepseek-v4.1-flash",
+    name: "deepseek-v4.1-flash",
+    contextWindow: 200000,
+    maxTokens: 32768,
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+    compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
+    thinkingLevelMap: { off: "none", high: "medium" },
+    samplingParams: { temperature: 0.6 },
+  };
+  // What a bare portal card detects: 32k default, no capabilities.
+  const bare = {
+    id: "deepseek-v4.1-flash",
+    name: "deepseek-v4.1-flash",
+    contextWindow: 32768,
+    maxTokens: 8192,
+    reasoning: false,
+    input: ["text"] as ("text" | "image")[],
+  };
+
+  it("keeps stored metadata when detection reports only defaults", () => {
+    const [m] = mergeModels([stored], [bare]);
+    expect(m.contextWindow).toBe(200000);
+    expect(m.maxTokens).toBe(32768);
+    expect(m.reasoning).toBe(true);
+    expect(m.input).toEqual(["text", "image"]);
+    expect(m.compat).toEqual(stored.compat);
+    expect(m.thinkingLevelMap).toEqual(stored.thinkingLevelMap);
+    expect(m.samplingParams).toEqual(stored.samplingParams);
+  });
+
+  it("lets strictly better detection win", () => {
+    const [m] = mergeModels([stored], [{ ...bare, contextWindow: 1000000, maxTokens: 131072 }]);
+    expect(m.contextWindow).toBe(1000000);
+    expect(m.maxTokens).toBe(131072);
+  });
+
+  it("prefers a freshly detected alias over a stored id-as-name", () => {
+    const [m] = mergeModels(
+      [{ ...stored, name: "stored-id" }],
+      [{ ...bare, name: "Qwen Alias" }],
+    );
+    expect(m.name).toBe("Qwen Alias");
+  });
+
+  it("keeps detection's own compat evidence over a stored override", () => {
+    const detected = { ...bare, compat: { supportsReasoningEffort: false, supportsDeveloperRole: false } };
+    const [m] = mergeModels([stored], [detected]);
+    expect(m.compat).toEqual(detected.compat);
+  });
+
+  it("passes unknown models through untouched", () => {
+    const [m] = mergeModels([], [bare]);
+    expect(m).toEqual(bare);
   });
 });

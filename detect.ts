@@ -871,15 +871,192 @@ export async function detectVllm(
 
   return {
     apiType: "vllm",
-    models: entries.map((m) => ({
-      id: m.id,
-      name: m.id.split("/").pop() ?? m.id,
-      contextWindow: m.max_model_len,
-      maxTokens: capTokens(m.max_model_len),
-      reasoning: false,
-      input: ["text"],
-    })),
+    models: entries.map((m) => {
+      const inferred = inferModelMetadata(m.id);
+      const reasoning = inferred.reasoning ?? false;
+      const vision = inferred.vision ?? false;
+      return {
+        id: m.id,
+        name: m.id.split("/").pop() ?? m.id,
+        contextWindow: m.max_model_len,
+        maxTokens: inferred.maxTokens ?? capTokens(m.max_model_len, reasoning),
+        reasoning,
+        input: (vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+        ...(inferred.compat ? { compat: inferred.compat } : {}),
+        ...(inferred.thinkingLevelMap ? { thinkingLevelMap: inferred.thinkingLevelMap } : {}),
+      };
+    }),
   };
+}
+
+// ─── Model capability inference for bare cards ─────────────────────
+// Many gateways, routers, and proxies (OneAPI, NewAPI, standard OpenAI relays)
+// return bare model cards with only { id, object, created, owned_by }.
+// When neither context window nor capability flags exist on the card, we infer
+// them from well-known model architectures and families so reasoning effort,
+// vision, and large context windows work out of the box instead of dropping
+// to 32k/8k/reasoning=false.
+
+export interface InferredModelMetadata {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  vision?: boolean;
+  compat?: { supportsReasoningEffort?: boolean; supportsDeveloperRole?: boolean };
+  thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+  samplingParams?: { temperature?: number };
+}
+
+const DEFAULT_STANDARD_THINKING_LEVELS: Partial<Record<ThinkingLevel, string | null>> = {
+  off: "none",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
+};
+
+const OPENAI_REASONING_LEVELS: Partial<Record<ThinkingLevel, string | null>> = {
+  off: null,
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "high",
+  max: "high",
+};
+
+const QWEN_REASONING_LEVELS: Partial<Record<ThinkingLevel, string | null>> = {
+  off: "none",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "medium",
+  xhigh: "xhigh",
+  max: "xhigh",
+};
+
+export function inferModelMetadata(id: string): InferredModelMetadata {
+  const cleanId = (id.split("/").pop() ?? id).toLowerCase();
+
+  // 1. DeepSeek (V3, V4, V4.1, R1, Flash)
+  if (/deepseek|r1\b|v4\.?1|v3\b/i.test(cleanId)) {
+    const is1M = /(?:-|_)?1m\b/i.test(cleanId);
+    return {
+      contextWindow: is1M ? 1000000 : 200000,
+      maxTokens: is1M ? 131072 : 32768,
+      reasoning: true,
+      vision: true,
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+      thinkingLevelMap: DEFAULT_STANDARD_THINKING_LEVELS,
+    };
+  }
+
+  // 2. Claude (Haiku, Sonnet, Opus)
+  if (/claude|haiku|sonnet|opus/i.test(cleanId)) {
+    return {
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: true,
+      vision: true,
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+      thinkingLevelMap: DEFAULT_STANDARD_THINKING_LEVELS,
+    };
+  }
+
+  // 3. GLM (GLM-4, GLM-5, 5.3 Flash)
+  if (/glm/i.test(cleanId)) {
+    return {
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: true,
+      vision: true,
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+      thinkingLevelMap: DEFAULT_STANDARD_THINKING_LEVELS,
+    };
+  }
+
+  // 4. Gemini
+  if (/gemini/i.test(cleanId)) {
+    const isThinking = /thinking|pro\b/i.test(cleanId);
+    return {
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: isThinking,
+      vision: true,
+      ...(isThinking
+        ? { compat: { supportsReasoningEffort: true }, thinkingLevelMap: DEFAULT_STANDARD_THINKING_LEVELS }
+        : {}),
+    };
+  }
+
+  // 5. GPT / OpenAI & Luna
+  if (/luna/i.test(cleanId)) {
+    return {
+      contextWindow: 148000,
+      maxTokens: 32768,
+      reasoning: false,
+      vision: true,
+    };
+  }
+  if (/^o[1-9]/i.test(cleanId) || /o[1-9]-mini/i.test(cleanId)) {
+    return {
+      contextWindow: 200000,
+      maxTokens: 65536,
+      reasoning: true,
+      vision: true,
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
+      thinkingLevelMap: OPENAI_REASONING_LEVELS,
+    };
+  }
+  if (/gpt/i.test(cleanId)) {
+    return {
+      contextWindow: 128000,
+      maxTokens: 16384,
+      reasoning: false,
+      vision: true,
+    };
+  }
+
+  // 6. Qwen & QwQ
+  if (/qwen|qwq/i.test(cleanId)) {
+    const isThinking = /qwq|thinking|reason/i.test(cleanId);
+    const is1M = /1m/i.test(cleanId);
+    return {
+      contextWindow: is1M ? 1000000 : 131072,
+      maxTokens: isThinking ? 32768 : 16384,
+      reasoning: isThinking,
+      vision: /vl/i.test(cleanId),
+      ...(isThinking
+        ? { compat: { supportsReasoningEffort: true }, thinkingLevelMap: QWEN_REASONING_LEVELS }
+        : {}),
+    };
+  }
+
+  // 7. Gemma
+  if (/gemma/i.test(cleanId)) {
+    return {
+      contextWindow: 131072,
+      maxTokens: 8192,
+      reasoning: false,
+      vision: false,
+    };
+  }
+
+  // 8. Generic thinking/reasoning model by name
+  if (/thinking|reason/i.test(cleanId)) {
+    return {
+      contextWindow: 128000,
+      maxTokens: 16384,
+      reasoning: true,
+      vision: false,
+      compat: { supportsReasoningEffort: true },
+      thinkingLevelMap: DEFAULT_STANDARD_THINKING_LEVELS,
+    };
+  }
+
+  return {};
 }
 
 // ─── Generic OpenAI-compatible fallback ────────────────────────────
@@ -1294,15 +1471,17 @@ export async function detectOpenAI(
   return {
     apiType: "openai",
     models: res.data.map((m) => {
-      const contextWindow =
-        firstNumber(
-          m.max_model_len,
-          m.max_input_tokens,
-          m.maxInputTokens,
-          m.top_provider?.context_length,
-          m.context_window,
-          m.context_length,
-        ) ?? 32768;
+      const inferred = inferModelMetadata(m.id);
+
+      const explicitContext = firstNumber(
+        m.max_model_len,
+        m.max_input_tokens,
+        m.maxInputTokens,
+        m.top_provider?.context_length,
+        m.context_window,
+        m.context_length,
+      );
+      const contextWindow = explicitContext ?? inferred.contextWindow ?? 32768;
 
       const params = m.supported_parameters ?? [];
       const modalities = m.architecture?.input_modalities ?? [];
@@ -1310,9 +1489,14 @@ export async function detectOpenAI(
       const reasoning =
         params.includes("reasoning_effort") ||
         params.includes("include_reasoning") ||
-        declaredReasoning === true;
+        declaredReasoning === true ||
+        (declaredReasoning === undefined && (inferred.reasoning ?? false));
+
       const declaredVision = declaredFlag(m, ["supports_vision", "vision"]);
-      const vision = modalities.includes("image") || declaredVision === true;
+      const vision =
+        modalities.includes("image") ||
+        declaredVision === true ||
+        (declaredVision === undefined && (inferred.vision ?? false));
 
       // A declared output ceiling is only trusted when it is a real
       // restriction. Cards that repeat the whole context window here mean
@@ -1328,7 +1512,7 @@ export async function detectOpenAI(
       const maxTokens =
         declaredMax !== undefined && declaredMax < contextWindow
           ? declaredMax
-          : capTokens(contextWindow, reasoning);
+          : (inferred.maxTokens ?? capTokens(contextWindow, reasoning));
 
       const result: DiscoveredModel = {
         id: m.id,
@@ -1339,13 +1523,20 @@ export async function detectOpenAI(
         input: (vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
       };
 
+      if (inferred.compat) {
+        result.compat = { ...inferred.compat };
+      }
+      if (inferred.thinkingLevelMap) {
+        result.thinkingLevelMap = { ...inferred.thinkingLevelMap };
+      }
+
       // If the card publishes its accepted effort tiers, register the map
       // directly instead of relying on the probe sweep: unmapped levels get
       // null so Pi stops offering tiers the model cannot take, and the level
       // Pi actually sends is rewritten to a string the portal accepts.
       const efforts = declaredEfforts(m);
       if (efforts.length > 0) {
-        result.compat = { supportsReasoningEffort: true };
+        result.compat = { ...result.compat, supportsReasoningEffort: true };
         result.thinkingLevelMap = {
           ...(efforts.includes("none") ? { off: "none" } : {}),
           ...Object.fromEntries(

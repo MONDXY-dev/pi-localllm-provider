@@ -1125,6 +1125,92 @@ describe("detectOpenAI", () => {
       },
     });
   });
+
+  it("infers rich capabilities for bare OpenAI cards from known model families", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [
+          { id: "rb/deepseek-v4.1-flash-1017", object: "model", created: 1793096710, owned_by: "DeepSeek" },
+          { id: "rb/deepseek-v4.1-flash", object: "model", created: 1793031496, owned_by: "DeepSeek" },
+          { id: "rb/glm-5.3-flash", object: "model", created: 1793096710, owned_by: "Z.ai" },
+          { id: "rb/claude-haiku-5-5", object: "model", created: 1793096710, owned_by: "Anthropic" },
+          { id: "rb/gpt-6-luna", object: "model", created: 1793096710, owned_by: "OpenAI" },
+          { id: "as/gemma-4-31b", object: "model", created: 1793420723, owned_by: "Google" },
+          { id: "deepseek-v4.1-flash-1017-1M", object: "model" },
+          { id: "custom-unrecognized-model", object: "model" },
+        ],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models).toHaveLength(8);
+
+    // DeepSeek
+    expect(result.models[0]).toMatchObject({
+      id: "rb/deepseek-v4.1-flash-1017",
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: true,
+      input: ["text", "image"],
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+    });
+    expect(result.models[0].thinkingLevelMap).toMatchObject({ off: "none", high: "high", max: "max" });
+
+    // Claude
+    expect(result.models[3]).toMatchObject({
+      id: "rb/claude-haiku-5-5",
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: true,
+      input: ["text", "image"],
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+    });
+
+    // GLM
+    expect(result.models[2]).toMatchObject({
+      id: "rb/glm-5.3-flash",
+      contextWindow: 200000,
+      maxTokens: 32768,
+      reasoning: true,
+      input: ["text", "image"],
+    });
+
+    // Luna
+    expect(result.models[4]).toMatchObject({
+      id: "rb/gpt-6-luna",
+      contextWindow: 148000,
+      maxTokens: 32768,
+      reasoning: false,
+      input: ["text", "image"],
+    });
+
+    // Gemma
+    expect(result.models[5]).toMatchObject({
+      id: "as/gemma-4-31b",
+      contextWindow: 131072,
+      maxTokens: 8192,
+      reasoning: false,
+      input: ["text"],
+    });
+
+    // 1M variant
+    expect(result.models[6]).toMatchObject({
+      id: "deepseek-v4.1-flash-1017-1M",
+      contextWindow: 1000000,
+      maxTokens: 131072,
+      reasoning: true,
+      input: ["text", "image"],
+    });
+
+    // Unknown stays safe default
+    expect(result.models[7]).toMatchObject({
+      id: "custom-unrecognized-model",
+      contextWindow: 32768,
+      maxTokens: 8192,
+      reasoning: false,
+      input: ["text"],
+    });
+    expect(result.models[7].compat).toBeUndefined();
+  });
 });
 
 // A card as ds4_server.c actually emits it — same shape for every alias,
@@ -1198,7 +1284,7 @@ describe("ds4", () => {
 
   it("stays generic when only some cards carry the ds4 owner", async () => {
     mockFetch({
-      "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash"), { id: "other", owned_by: "acme" }] },
+      "http://x/v1/models": { data: [ds4Card("generic-model"), { id: "other", owned_by: "acme" }] },
     });
     const result = await detectOpenAI("http://x/v1", "");
     expect(result.apiType).toBe("openai");
