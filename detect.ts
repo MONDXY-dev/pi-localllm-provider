@@ -27,6 +27,7 @@ export type ApiType =
   | "vllm"
   | "ds4"
   | "ninfer"
+  | "anthropic"
   | "openai";
 
 export interface DiscoveredModel {
@@ -1104,6 +1105,22 @@ interface OpenAIModels {
   data?: OpenAIModelCard[];
 }
 
+// Anthropic's List Models card (also emitted by gateways when the request
+// carries anthropic-version), plus the optional limits some add on top.
+interface AnthropicModelCard {
+  id: string;
+  display_name?: string;
+  name?: string;
+  context_window?: number;
+  max_input_tokens?: number;
+  max_tokens?: number;
+  max_output_tokens?: number;
+}
+
+interface AnthropicModels {
+  data?: AnthropicModelCard[];
+}
+
 function firstNumber(...values: unknown[]): number | undefined {
   for (const v of values) if (typeof v === "number" && v > 0) return v;
   return undefined;
@@ -1553,6 +1570,60 @@ export async function detectOpenAI(
   };
 }
 
+// Anthropic Messages has no protocol marker an HTTP probe can trust: a
+// translating gateway answers /v1/models in (nearly) the same shape whether the
+// key belongs to an Anthropic or an OpenAI model, and the Messages endpoint
+// exists on both kinds of route. The API type is therefore an explicit user
+// choice (see the wizard) and this detector only runs when that choice is
+// already stored, or was just made.
+const ANTHROPIC_DEFAULT_CONTEXT = 200000;
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 32000;
+
+export async function detectAnthropic(
+  baseUrl: string,
+  apiKey: string,
+  signal?: AbortSignal,
+  diagnostics?: ProbeDiagnostic[],
+): Promise<DetectResult> {
+  const root = baseUrl.replace(/\/v1$/, "");
+  const url = `${root}/v1/models`;
+  const headers: Record<string, string> = { "anthropic-version": "2023-06-01" };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+    headers["x-api-key"] = apiKey;
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers,
+      signal: signal ?? AbortSignal.timeout(STANDALONE_PROBE_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      recordFailure(diagnostics, url, res.status);
+      return { apiType: "anthropic", models: [] };
+    }
+    const body = (await res.json()) as AnthropicModels;
+    const cards = body.data ?? [];
+    return {
+      apiType: "anthropic",
+      models: cards
+        .filter((card) => typeof card?.id === "string" && card.id.length > 0)
+        .map((card) => ({
+          id: card.id,
+          name: card.display_name || card.name || card.id,
+          contextWindow:
+            firstNumber(card.context_window, card.max_input_tokens) ?? ANTHROPIC_DEFAULT_CONTEXT,
+          maxTokens: firstNumber(card.max_tokens, card.max_output_tokens) ?? ANTHROPIC_DEFAULT_MAX_TOKENS,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+        })),
+    };
+  } catch (err) {
+    recordException(diagnostics, url, err);
+    return { apiType: "anthropic", models: [] };
+  }
+}
+
 // ─── Failure summarization ─────────────────────────────────────────
 // Only called when the whole chain ends with zero models. Distinguishes
 // "something actually went wrong" from "server's fine, just has nothing
@@ -1595,12 +1666,22 @@ export async function detectModels(
   baseUrl: string,
   apiKey: string,
   signal?: AbortSignal,
+  preferredApiType?: ApiType,
 ): Promise<DetectResult> {
   const chainSignal = signal
     ? AbortSignal.any([signal, AbortSignal.timeout(CHAIN_TIMEOUT_MS)])
     : AbortSignal.timeout(CHAIN_TIMEOUT_MS);
   const root = baseUrl.replace(/\/v1$/, "");
   const diagnostics: ProbeDiagnostic[] = [];
+
+  if (preferredApiType === "anthropic") {
+    const result = await detectAnthropic(baseUrl, apiKey, chainSignal, diagnostics);
+    if (result.models.length === 0) {
+      const error = summarizeFailure(diagnostics);
+      if (error) return { ...result, error };
+    }
+    return result;
+  }
 
   const result =
     (await detectMtplx(root, apiKey, chainSignal, diagnostics)) ??

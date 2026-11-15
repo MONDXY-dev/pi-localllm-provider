@@ -1,6 +1,6 @@
 # pi-localllm-provider
 
-A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, ninfer, or anything else with an OpenAI-compatible API.
+A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, ninfer, Anthropic Messages gateways, or anything else with an OpenAI-compatible API.
 
 - **One command, one place** — `/localllm` is a single TUI menu for adding, inspecting, and managing every local server's integration with Pi — no subcommands, no hand-editing `settings.json`.
 - **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from each backend's own API by a detector written for it, and probed directly where a backend publishes nothing, not typed into a config file and hoped correct.
@@ -53,8 +53,9 @@ Models:  (✓ = loaded in memory, ○ = will be loaded on first message)
 ## Wizard flow
 
 1. **Server name** — any label
-2. **Base URL** — `http://host:8000`, `.../v1`, or a bare `host:8000` (scheme defaults to `http://`)
-3. **API key** — blank if unauthenticated. A plain key on macOS offers Keychain storage — see [API key storage](#api-key-storage)
+2. **API protocol** — `OpenAI-compatible` (auto-detected) or `Anthropic Messages (/v1/messages)`. The choice is explicit because a translating gateway answers discovery the same way for both, so no probe can tell them apart — and only the Anthropic route carries `cache_control` prompt caching
+3. **Base URL** — `http://host:8000`, `.../v1`, or a bare `host:8000` (scheme defaults to `http://`). For Anthropic the stored URL stays at the root, since Pi's client appends `/v1/messages` itself
+4. **API key** — blank if unauthenticated. A plain key on macOS offers Keychain storage — see [API key storage](#api-key-storage)
 
 Then the [detection chain](#backend-detection) runs and you pick which discovered models to enable. If that's a single model, you'll be asked whether to switch to it right away; otherwise, switch between them with `/model`.
 
@@ -98,6 +99,9 @@ No — every configured server re-registers automatically on startup.
 | ds4 | `GET /v1/models` with `owned_by: "ds4.c"` | context window, max tokens, reasoning, request compat — see note |
 | ninfer | `GET /v1/models` with `owned_by: "ninfer"` | context window, reasoning, vision, request compat — all measured, see note |
 | OpenAI-compatible | `GET /v1/models` | context window from `max_model_len`, `top_provider.context_length`, `context_window` or `context_length`; name, reasoning and vision from an OpenRouter-style card |
+| Anthropic Messages | `GET /v1/models` with `anthropic-version` | Anthropic List Models cards (`display_name`, optional limits); selected explicitly in the wizard, see note |
+
+Anthropic is not part of the fallback chain on purpose. Gateways that translate both protocols return a model list in the requested shape, so a probe would classify an Anthropic model as OpenAI-compatible and quietly lose prompt caching. The wizard asks for the protocol, stores it as `apiType: "anthropic"`, and `↺ Refresh` keeps using it. Requests then go to `POST /v1/messages` with `cache_control`; the key is sent as a Bearer token as well as through the client's `x-api-key`.
 
 Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, SGLang, ninfer, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
 

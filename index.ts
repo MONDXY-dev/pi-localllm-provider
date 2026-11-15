@@ -23,10 +23,10 @@ interface LLMModel {
   samplingParams?: { temperature?: number };
 }
 
-interface LLMServer {
+export interface LLMServer {
   id: string;         // stable random ID, used as provider ID suffix
   name: string;       // user-facing display name
-  baseUrl: string;    // always ends with /v1
+  baseUrl: string;    // OpenAI: ends with /v1; anthropic: bare root (client appends /v1/messages)
   apiKey: string;     // "" if not required
   apiType: ApiType;   // backend detected at last add/refresh
   models: LLMModel[];
@@ -77,11 +77,14 @@ function toProviderId(server: LLMServer): string {
   return `localllm-${slug || server.id}`;
 }
 
-export function normalizeBaseUrl(raw: string): string {
+export function normalizeBaseUrl(raw: string, apiType?: ApiType): string {
   let stripped = raw.trim().replace(/\/+$/, "");
   if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(stripped)) {
     stripped = `http://${stripped}`;
   }
+  // Pi's Anthropic client appends /v1/messages itself, so storing /v1 here
+  // would produce /v1/v1/messages.
+  if (apiType === "anthropic") return stripped.replace(/\/v1$/, "");
   return stripped.endsWith("/v1") ? stripped : `${stripped}/v1`;
 }
 
@@ -96,6 +99,7 @@ export function apiTypeLabel(apiType: ApiType): string {
     case "vllm": return "vLLM";
     case "ds4": return "ds4";
     case "ninfer": return "ninfer";
+    case "anthropic": return "Anthropic Messages";
     case "openai": return "OpenAI-compatible";
   }
 }
@@ -182,12 +186,19 @@ export function formatModelLine(m: LLMModel): string {
 
 // ─── Provider registration ────────────────────────────────────────
 
-function registerServer(pi: ExtensionAPI, server: LLMServer): void {
+export function registerServer(pi: ExtensionAPI, server: LLMServer): void {
+  const anthropic = server.apiType === "anthropic";
   pi.registerProvider(toProviderId(server), {
     name: server.name,
     baseUrl: server.baseUrl,
     apiKey: server.apiKey || "no-key",
-    api: "openai-completions",
+    api: anthropic ? "anthropic-messages" : "openai-completions",
+    // Anthropic-compatible gateways commonly accept the key as a Bearer
+    // token rather than in x-api-key; the built-in client still sends
+    // x-api-key for the real Anthropic API.
+    ...(anthropic
+      ? { authHeader: true, headers: { "anthropic-version": "2023-06-01" } }
+      : {}),
     models: server.models.map((m) => ({
       id: m.id,
       name: m.name,
@@ -274,21 +285,35 @@ async function runWizard(
   existing?: LLMServer,
 ): Promise<LLMServer | null> {
   const name = await ctx.ui.input(
-    'Step 1/3 - Server name (e.g. "My vLLM", "Ollama", "LM Studio")',
+    'Step 1/4 - Server name (e.g. "My vLLM", "Ollama", "LM Studio")',
     existing?.name ?? "",
   );
   if (!name?.trim()) return null;
 
+  // The wire protocol is a user choice, not something a probe can infer:
+  // translating gateways answer OpenAI and Anthropic discovery alike, so
+  // detection alone would always pick OpenAI and silently lose caching.
+  const PROTO_OPENAI = "OpenAI-compatible (auto-detect)";
+  const PROTO_ANTHROPIC = "Anthropic Messages (/v1/messages)";
+  const protocols =
+    existing?.apiType === "anthropic"
+      ? [PROTO_ANTHROPIC, PROTO_OPENAI]
+      : [PROTO_OPENAI, PROTO_ANTHROPIC];
+  const protocol = await ctx.ui.select("Step 2/4 - API protocol", protocols);
+  if (!protocol) return null;
+  const apiTypeChoice: ApiType | undefined =
+    protocol === PROTO_ANTHROPIC ? "anthropic" : undefined;
+
   const urlInput = await ctx.ui.input(
-    "Step 2/3 - Base URL",
+    "Step 3/4 - Base URL",
     existing ? existing.baseUrl.replace(/\/v1$/, "") : "http://localhost:8000",
   );
   if (!urlInput?.trim()) return null;
-  const baseUrl = normalizeBaseUrl(urlInput);
+  const baseUrl = normalizeBaseUrl(urlInput, apiTypeChoice);
   const id = existing?.id ?? generateId();
 
   const apiKeyInput = await ctx.ui.input(
-    "Step 3/3 - API key (leave blank if not required)",
+    "Step 4/4 - API key (leave blank if not required)",
     existing?.apiKey ?? "",
   );
   let apiKey = apiKeyInput?.trim() ?? "";
@@ -315,7 +340,7 @@ async function runWizard(
   ctx.ui.notify(`Connecting to ${baseUrl} ...`, "info");
   let result: DetectResult;
   try {
-    result = await detectModels(baseUrl, apiKey, ctx.signal);
+    result = await detectModels(baseUrl, apiKey, ctx.signal, apiTypeChoice);
   } catch (err: unknown) {
     ctx.ui.notify(
       `Cannot reach server: ${err instanceof Error ? err.message : String(err)}`,
@@ -534,7 +559,7 @@ async function showServerMenu(
       ctx.ui.notify(`Refreshing ${server.name} ...`, "info");
       let result: DetectResult;
       try {
-        result = await detectModels(server.baseUrl, server.apiKey, ctx.signal);
+        result = await detectModels(server.baseUrl, server.apiKey, ctx.signal, server.apiType);
       } catch (err: unknown) {
         ctx.ui.notify(
           `Failed: ${err instanceof Error ? err.message : String(err)}`,

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  detectAnthropic,
   detectLlamaCpp,
   detectLmStudio,
   detectModels,
@@ -1646,5 +1647,90 @@ describe("ninfer through the chain", () => {
     const result = await detectModels("http://x/v1", "");
     expect(result.models[0].reasoning).toBe(false);
     expect(result.models[0].thinkingLevelMap).toBeUndefined();
+  });
+});
+
+describe("detectAnthropic", () => {
+  it("reads Anthropic List Models cards, including display names and limits", async () => {
+    mockFetch({
+      "https://api.example.com/v1/models": {
+        data: [
+          { id: "hk-5-5", display_name: "HK-5.5", created_at: "2026-10-08T12:00:31Z" },
+          {
+            id: "with-limits",
+            name: "Limits",
+            context_window: 1000000,
+            max_output_tokens: 131072,
+          },
+          { display_name: "no id, dropped" },
+        ],
+        has_more: false,
+        first_id: "hk-5-5",
+        last_id: "with-limits",
+      },
+    });
+
+    const result = await detectAnthropic("https://api.example.com", "sk-test");
+
+    expect(result.apiType).toBe("anthropic");
+    expect(result.models.map((m) => m.id)).toEqual(["hk-5-5", "with-limits"]);
+    expect(result.models[0]).toMatchObject({
+      name: "HK-5.5",
+      contextWindow: 200000,
+      maxTokens: 32000,
+      reasoning: false,
+      input: ["text"],
+    });
+    expect(result.models[1]).toMatchObject({
+      name: "Limits",
+      contextWindow: 1000000,
+      maxTokens: 131072,
+    });
+  });
+
+  it("normalizes a stored /v1 base URL instead of doubling the segment", async () => {
+    const fetchMock = vi.fn(async () =>
+      ({ ok: true, json: async () => ({ data: [{ id: "m" }] }) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await detectAnthropic("https://api.example.com/v1", "sk-test");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.example.com/v1/models",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer sk-test",
+          "x-api-key": "sk-test",
+          "anthropic-version": "2023-06-01",
+        }),
+      }),
+    );
+  });
+
+  it("leaves the auth headers out when the server needs no key", async () => {
+    const fetchMock = vi.fn(async () =>
+      ({ ok: true, json: async () => ({ data: [{ id: "m" }] }) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await detectAnthropic("http://localhost:9000", "");
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.headers).toEqual({ "anthropic-version": "2023-06-01" });
+  });
+
+  it("only takes the Anthropic path when that protocol was chosen", async () => {
+    const fetchMock = vi.fn(async () =>
+      ({ ok: false, status: 401, json: async () => ({}) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await detectModels("https://api.example.com", "bad-key", undefined, "anthropic");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.apiType).toBe("anthropic");
+    expect(result.models).toEqual([]);
+    expect(result.error).toContain("401");
   });
 });

@@ -1,5 +1,14 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { formatModelLine, mergeModels, modelIdsChanged, modelsHeading, normalizeBaseUrl } from "./index.ts";
+import {
+  formatModelLine,
+  mergeModels,
+  modelIdsChanged,
+  modelsHeading,
+  normalizeBaseUrl,
+  registerServer,
+  type LLMServer,
+} from "./index.ts";
 
 describe("normalizeBaseUrl", () => {
   it("appends /v1 when missing", () => {
@@ -244,5 +253,69 @@ describe("mergeModels", () => {
   it("passes unknown models through untouched", () => {
     const [m] = mergeModels([], [bare]);
     expect(m).toEqual(bare);
+  });
+});
+
+describe("normalizeBaseUrl with an explicit protocol", () => {
+  it("keeps the bare root for Anthropic, whose client appends /v1/messages", () => {
+    expect(normalizeBaseUrl("https://api.example.com", "anthropic")).toBe("https://api.example.com");
+    expect(normalizeBaseUrl("https://api.example.com/v1", "anthropic")).toBe("https://api.example.com");
+    expect(normalizeBaseUrl("https://api.example.com/v1/", "anthropic")).toBe("https://api.example.com");
+  });
+
+  it("still appends /v1 for every OpenAI-compatible backend", () => {
+    expect(normalizeBaseUrl("https://api.example.com", "vllm")).toBe("https://api.example.com/v1");
+    expect(normalizeBaseUrl("https://api.example.com", undefined)).toBe("https://api.example.com/v1");
+  });
+});
+
+describe("registerServer", () => {
+  function capture(server: LLMServer) {
+    const registered: { id: string; config: Record<string, unknown> }[] = [];
+    const pi = {
+      registerProvider: (id: string, config: Record<string, unknown>) => {
+        registered.push({ id, config });
+      },
+      unregisterProvider: () => {},
+    } as unknown as ExtensionAPI;
+    registerServer(pi, server);
+    return registered[0];
+  }
+
+  const model = {
+    id: "hk-5-5",
+    name: "HK-5.5",
+    contextWindow: 200000,
+    maxTokens: 64000,
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+  };
+
+  it("registers Anthropic servers against /v1/messages with a Bearer key", () => {
+    const { config } = capture({
+      id: "abc123",
+      name: "kui1 HK",
+      baseUrl: "https://api.example.com",
+      apiKey: "sk-test",
+      apiType: "anthropic",
+      models: [model],
+    });
+    expect(config.api).toBe("anthropic-messages");
+    expect(config.authHeader).toBe(true);
+    expect(config.headers).toEqual({ "anthropic-version": "2023-06-01" });
+  });
+
+  it("leaves OpenAI-compatible servers on chat completions without auth extras", () => {
+    const { config } = capture({
+      id: "abc123",
+      name: "My vLLM",
+      baseUrl: "http://localhost:8000/v1",
+      apiKey: "",
+      apiType: "vllm",
+      models: [model],
+    });
+    expect(config.api).toBe("openai-completions");
+    expect(config.authHeader).toBeUndefined();
+    expect(config.headers).toBeUndefined();
   });
 });
